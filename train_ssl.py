@@ -62,12 +62,13 @@ def train_one_epoch(detector,ema_detector,label_dataloader,unlabel_dataloader,op
 
     for batch_idx,(batch_data_label) in enumerate(label_dataloader):
         try:
-            #无标签的部分
+            #无标签的部分,若一遍加载完成则重新打乱
             batch_data_unlabel = next(unlabel_dataloader_iterator)
         except StopIteration:
             unlabel_dataloader_iterator = iter(unlabel_dataloader)
             batch_data_unlabel = next(unlabel_dataloader)
 
+        labeled_num = len(batch_data_label['clip_info'])
         #对input_data进行拼接
         for key in batch_data_unlabel:
             if key == 'clip_info':
@@ -77,6 +78,7 @@ def train_one_epoch(detector,ema_detector,label_dataloader,unlabel_dataloader,op
                 batch_data_label[key] = torch.cat((batch_data_label[key],batch_data_unlabel[key]))
 
         for key in batch_data_label:
+            #对加载的特征放到cuda上，list则暂且不动
             if isinstance(batch_data_label[key], torch.Tensor):
                 batch_data_label[key] = batch_data_label[key].to(device)
 
@@ -90,33 +92,40 @@ def train_one_epoch(detector,ema_detector,label_dataloader,unlabel_dataloader,op
 
         predictions,cls_logits,loc_logits,endpoint = detector(student_input)
         ema_pre,ema_clsg,ema_locg,ema_endpoint = ema_detector(teacher_input)
+        # print("student 预测的结果：",cls_logits[0])
+        # print("teacher 预测的结果:", ema_clsg[0])
+
 
         #计算loss -监督和一致性
-        #监督
+        #预测中属于监督计算的部分
         supervised_cls = []
         supervised_loc = []
 
         for i,layer in enumerate(cfg.anchor_info["feat_layers"]):
-            supervised_cls.append(cls_logits[i][:batch_size_list[0]])
-            supervised_loc.append(loc_logits[i][:batch_size_list[0]])
+            supervised_cls.append(cls_logits[i][:labeled_num])
+            supervised_loc.append(loc_logits[i][:labeled_num])
 
+        #监督损失
         detector_loss = compute_detector_loss(cfg,supervised_cls,supervised_loc,batch_data_label['cls_label'], batch_data_label['loc_label'],batch_data_label['iou_label'],device)
-        print('detection loss',detector_loss[0])
         #一致性损失
-        consistency_loss = compute_consistency_loss(cfg,predictions,ema_pre,cls_logits,ema_clsg,loc_logits,ema_locg) #参数都是在cuda上的
+        consistency_loss = compute_consistency_loss(cfg,cls_logits,ema_clsg,loc_logits,ema_locg,device) #参数都是在cuda上的
 
 
-        # loss = detector_loss+consistency_loss
+        loss = detector_loss[0] +consistency_loss[0]*cfg.consistency_weight
 
-        detector_loss[0].backward()
+        loss.backward()
         optimizer.step()
 
         global_step += 1
 
         #更新ema的变量
-        # update_ema_variables(detector,ema_detector,cfg.ema_decay,global_step)
+        update_ema_variables(detector,ema_detector,cfg.ema_decay,global_step)
 
         #输出统计的loss等
+        if ((batch_idx + 1) % 50 == 0):
+            print("iter: %d, loss:%.5f, detector_loss:%.5f, supervised_loc_loss:%.5f, supervised_pos_loss:%.5f, supervised_neg_loss:%.5f" % (
+                batch_idx + 1, loss, detector_loss[0], detector_loss[3], detector_loss[1], detector_loss[2]))
+            print("consistency_loss:%.5f, loc_cons_loss:%.5f, cls_cons_loss:%.5f" % (consistency_loss[0], consistency_loss[1],consistency_loss[2]))
 
     return global_step
 
@@ -164,6 +173,11 @@ def train():
         log_string('\n********EPOCH  %03d, STEP %d *********' % (epoch+1, global_step))
         global_step = train_one_epoch(detector,ema_detector,label_dataloader,unlabel_dataloader,optimizer,global_step,device)
 
+        #保存模型
+        if epoch > 0 and (epoch+1) % 2 == 0:
+            save_dict = {'epoch:':epoch+1, 'optimizer_state_dict': optimizer.state_dict(),
+                     'model_state_dict':detector.state_dict(),'ema_model_state_dict':ema_detector.state_dict()}
+            torch.save(save_dict, cfg.ckpt_path + "/model_epoch_%d.pkl" % (epoch + 1))
 
 
 if __name__ == '__main__':
